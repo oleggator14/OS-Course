@@ -1,8 +1,11 @@
 #ifndef SIM_H
 #define SIM_H
 
-#include <stdarg.h>
 #include <signal.h>
+#include <stdarg.h>
+// Многопоточность
+#include <pthread.h>
+#include <semaphore.h>
 
 // Размеры поля
 #define FIELD_W 20
@@ -19,7 +22,7 @@
 typedef enum {
     CELL_EMPTY = 0,
     CELL_OBSTACLE,
-    CELL_WRECK  // Подбитый танк (препятствие)
+    CELL_WRECK // Подбитый танк (препятствие)
 } CellType;
 
 // Структура танка
@@ -29,7 +32,7 @@ typedef struct {
     int hp;
     int hp_max;
     int alive;
-    int dx, dy;  // Направление движения
+    int dx, dy; // Направление движения
 } Tank;
 
 // Структура орудия
@@ -37,33 +40,33 @@ typedef struct {
     int id;
     int x, y;
     int ammo;
-    int obs_range;      // Дальность наблюдения
-    int dmg_direct;     // Урон прямого попадания
-    int dmg_splash;     // Урон близкого разрыва
-    int flight_ticks;   // Время полета снаряда
-    int target_id;      // ID цели (-1 если нет)
-    int last_seen_x;    // Последнее известное положение цели
+    int obs_range; // Дальность наблюдения
+    int dmg_direct; // Урон прямого попадания
+    int dmg_splash; // Урон близкого разрыва
+    int flight_ticks; // Время полета снаряда
+    int target_id; // ID цели (-1 если нет)
+    int last_seen_x; // Последнее известное положение цели
     int last_seen_y;
-    int ready_tick;     // Когда можно стрелять
+    int ready_tick; // Когда можно стрелять
 } Gun;
 
 // Структура снаряда
 typedef struct {
     int active;
     int gun_id;
-    int target_x, target_y;  // Куда летит
-    int impact_tick;         // Когда взорвется
-    int dmg_direct;          // Копируется из орудия при выстреле
-    int dmg_splash;          // Копируется из орудия при выстреле
+    int target_x, target_y; // Куда летит
+    int impact_tick; // Когда взорвется
+    int dmg_direct; // Копируется из орудия при выстреле
+    int dmg_splash; // Копируется из орудия при выстреле
 } Shell;
 
 // Конфигурация
 typedef struct {
-    int max_ticks;          // 0 = без ограничения
-    int tick_delay_ms;      // Задержка между тактами
+    int max_ticks; // 0 = без ограничения
+    int tick_delay_ms; // Задержка между тактами
     int tank_hp;
     int gun_ammo;
-    int num_obstacles;      // Количество препятствий на поле
+    int num_obstacles; // Количество препятствий на поле
 } Config;
 
 // Статистика
@@ -87,7 +90,12 @@ typedef struct {
     Shell shells[MAX_SHELLS];
     Stats stats;
     char events[MAX_EVENTS][EVENT_LEN]; // Массив строк для событий такта
-    int n_events;                       // Счетчик событий
+    int n_events; // Счетчик событий
+    pthread_mutex_t world_mutex; // Мьютекс для защиты общего состояния (поле,
+                                 // танки, статистика)
+    pthread_cond_t tick_cond; // Условная переменная: будит потоки на новый такт
+    int tick_id; // Номер такта, который потокам надо отработать
+    sem_t done_sem; // Семафор: поток отчитался, что отработал такт
 } World;
 
 // Прототипы функций
@@ -98,8 +106,12 @@ void update_guns(World *w);
 void update_shells(World *w);
 void draw_field(const World *w);
 void print_stats(const World *w);
-void my_print(const char *fmt, ...); 
+void my_print(const char *fmt, ...);
 int shells_in_flight(const World *w);
 void add_event(World *w, const char *fmt, ...);
+void *tank_thread_func(void *arg);
+void *gun_thread_func(void *arg);
 
+extern volatile sig_atomic_t keep_running;
+extern World world;
 #endif

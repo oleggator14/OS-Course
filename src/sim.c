@@ -69,6 +69,12 @@ void world_init(World *w) {
 
     // Очищаем статистику
     memset(&w->stats, 0, sizeof(w->stats));
+
+    // Инициализация синхропримитивов для многопоточности
+    pthread_mutex_init(&w->world_mutex, NULL);
+    pthread_cond_init(&w->tick_cond, NULL); // Раньше её забыли инициализировать
+    sem_init(&w->done_sem, 0, 0);
+    w->tick_id = 0;
 }
 
 void add_event(World *w, const char *fmt, ...) {
@@ -82,54 +88,93 @@ void add_event(World *w, const char *fmt, ...) {
     w->n_events++;
 }
 
-// Обновление танков
-void update_tanks(World *w) {
+// Обновление танков, в потоках
+void *tank_thread_func(void *arg) {
+    Tank *t = (Tank *) arg;
     int dx[4] = {1, -1, 0, 0};
     int dy[4] = {0, 0, 1, -1};
 
-    for (int i = 0; i < w->n_tanks; i++) {
-        Tank *t = &w->tanks[i];
-        if (!t->alive) {
-            continue;
+    int last_tick = 0; // Номер такта, который этот поток уже отработал
+
+    while (1) {
+        pthread_mutex_lock(&world.world_mutex);
+
+        // Ждём именно НОВЫЙ номер такта. Флага "можно действовать" мало:
+        // поток, отработав, тут же видел его снова взведённым и ходил
+        // по несколько раз за такт.
+        while (world.tick_id == last_tick && keep_running) {
+            pthread_cond_wait(&world.tick_cond, &world.world_mutex);
         }
 
-        /* 20% шанс случайно сменить направление */
-        if (rand() % 100 < 20) {
-            int dir = rand() % 4;
-            t->dx = dx[dir];
-            t->dy = dy[dir];
+        // Если программа завершается, выходим из потока
+        if (!keep_running) {
+            pthread_mutex_unlock(&world.world_mutex);
+            break;
+        }
+        last_tick = world.tick_id;
+
+        // --- Логика движения (ровно 1 раз за такт) ---
+        if (t->alive) {
+            if (rand() % 100 < 20) {
+                int dir = rand() % 4;
+                t->dx = dx[dir];
+                t->dy = dy[dir];
+            }
+            int nx = t->x + t->dx;
+            int ny = t->y + t->dy;
+
+            if (nx >= 0 && nx < FIELD_W && ny >= 0 && ny < FIELD_H && world.field[ny][nx] != CELL_OBSTACLE &&
+                world.field[ny][nx] != CELL_WRECK) {
+                add_event(&world, "Танк %d: (%d,%d) -> (%d,%d)", t->id, t->x, t->y, nx, ny);
+                t->x = nx;
+                t->y = ny;
+            } else {
+                int dir = rand() % 4;
+                t->dx = dx[dir];
+                t->dy = dy[dir];
+                add_event(&world, "Танк %d: упёрся в границу/препятствие, меняет курс", t->id);
+            }
         }
 
-        int nx = t->x + t->dx;
-        int ny = t->y + t->dy;
-
-        // Границы + препятствия + обломки
-        if (nx >= 0 && nx < FIELD_W && ny >= 0 && ny < FIELD_H && w->field[ny][nx] != CELL_OBSTACLE &&
-            w->field[ny][nx] != CELL_WRECK) {
-            add_event(w, "Танк %d: (%d,%d) -> (%d,%d)", t->id, t->x, t->y, nx, ny);
-            t->x = nx;
-            t->y = ny;
-        } else {
-            int dir = rand() % 4;
-            t->dx = dx[dir];
-            t->dy = dy[dir];
-            add_event(w, "Танк %d: упёрся в границу/препятствие, меняет курс", t->id);
-        }
+        // Сообщаем главному потоку, что мы закончили действие на этом такте
+        pthread_mutex_unlock(&world.world_mutex);
+        sem_post(&world.done_sem);
     }
+    return NULL;
 }
 
-// Обновление орудий
-void update_guns(World *w) {
-    for (int i = 0; i < w->n_guns; i++) {
-        Gun *g = &w->guns[i];
-        if (g->ammo <= 0 || w->tick < g->ready_tick) {
+// Обновление орудий, в потоках
+void *gun_thread_func(void *arg) {
+    Gun *g = (Gun *) arg;
+
+    int last_tick = 0;
+
+    while (1) {
+        pthread_mutex_lock(&world.world_mutex);
+
+        // Орудие ждёт новый такт той же условной переменной, что и танки.
+        // Раньше оно висело на семафоре, который никто не открывал,
+        // поэтому орудия вообще ни разу не стреляли.
+        while (world.tick_id == last_tick && keep_running) {
+            pthread_cond_wait(&world.tick_cond, &world.world_mutex);
+        }
+
+        if (!keep_running) {
+            pthread_mutex_unlock(&world.world_mutex);
+            break;
+        }
+        last_tick = world.tick_id;
+
+        if (g->ammo <= 0 || world.tick < g->ready_tick) {
+            pthread_mutex_unlock(&world.world_mutex);
+            sem_post(&world.done_sem); // Отчитаться обязаны в любом случае
             continue;
         }
 
-        // Ищем ближайшего живого танка в радиусе наблюдения
+        // Ищем ближайшего живого танка
         int best_id = -1, best_dist = 999999;
-        for (int j = 0; j < w->n_tanks; j++) {
-            Tank *t = &w->tanks[j];
+        for (int j = 0; j < world.n_tanks; j++) {
+            Tank *t = &world.tanks[j];
             if (!t->alive) {
                 continue;
             }
@@ -142,50 +187,49 @@ void update_guns(World *w) {
 
         if (best_id < 0) {
             if (g->target_id != -1) {
-                add_event(w, "Орудие %d: цель потеряна", g->id);
+                add_event(&world, "Орудие %d: цель потеряна", g->id);
             }
             g->target_id = -1;
+            pthread_mutex_unlock(&world.world_mutex);
+            sem_post(&world.done_sem);
             continue;
         }
 
-        // Объявляем target ДО того, как он понадобится для add_event
-        Tank *target = &w->tanks[best_id - 1];
-
-        // Фиксируем момент наблюдения цели
-        if (g->target_id != best_id) {
-            add_event(w, "Орудие %d: наблюдение цели (Танк %d) в (%d,%d)", g->id, best_id, target->x, target->y);
-        }
-
         g->target_id = best_id;
+        Tank *target = &world.tanks[best_id - 1];
         g->last_seen_x = target->x;
         g->last_seen_y = target->y;
 
+        // Ищем свободный слот для снаряда
         int slot = -1;
         for (int k = 0; k < MAX_SHELLS; k++) {
-            if (!w->shells[k].active) {
+            if (!world.shells[k].active) {
                 slot = k;
                 break;
             }
         }
-        if (slot < 0) {
-            continue; // все слоты заняты - ждём
+
+        if (slot >= 0) {
+            Shell *s = &world.shells[slot];
+            s->active = 1;
+            s->gun_id = g->id;
+            s->target_x = target->x;
+            s->target_y = target->y;
+            s->impact_tick = world.tick + g->flight_ticks;
+            s->dmg_direct = g->dmg_direct;
+            s->dmg_splash = g->dmg_splash;
+            g->ammo--;
+            g->ready_tick = world.tick + 3;
+            world.stats.shots_fired++;
+            add_event(&world, "Орудие %d: ВЫСТРЕЛ по (%d,%d), разрыв на такте %d, снарядов осталось %d", g->id,
+                      s->target_x, s->target_y, s->impact_tick, g->ammo);
         }
 
-        Shell *s = &w->shells[slot];
-        s->active = 1;
-        s->gun_id = g->id;
-        s->target_x = target->x;
-        s->target_y = target->y;
-        s->impact_tick = w->tick + g->flight_ticks;
-        s->dmg_direct = g->dmg_direct;
-        s->dmg_splash = g->dmg_splash;
-
-        g->ammo--;
-        g->ready_tick = w->tick + 3;
-        w->stats.shots_fired++;
-        add_event(w, "Орудие %d: ВЫСТРЕЛ по (%d,%d), разрыв на такте %d, снарядов осталось %d", g->id, s->target_x,
-                  s->target_y, s->impact_tick, g->ammo);
+        pthread_mutex_unlock(&world.world_mutex);
+        sem_post(&world.done_sem);
     }
+
+    return NULL;
 }
 
 // Обновление снарядов

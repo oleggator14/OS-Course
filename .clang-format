@@ -12,16 +12,16 @@ IndentGotoLabels: false
 AllowShortEnumsOnASingleLine: true
 BreakBeforeBraces: Custom
 BraceWrapping:
-  AfterCaseLabel:  false
+  AfterCaseLabel: false
   AfterControlStatement: Never
   AfterExternBlock: false
   AfterObjCDeclaration: false
-  BeforeCatch:     false
-  BeforeElse:      false
+  BeforeCatch: false
+  BeforeElse: false
   BeforeLambdaBody: false
-  BeforeWhile:     false
-  IndentBraces:    false
+  BeforeWhile: false
+  IndentBraces: false
   SplitEmptyFunction: true
   SplitEmptyRecord: true
   SplitEmptyNamespace: true
-  
+AlignTrailingComments: false
